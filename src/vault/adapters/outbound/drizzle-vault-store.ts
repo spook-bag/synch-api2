@@ -1,0 +1,518 @@
+import { VaultApplicationError } from "../../application/errors/vault-errors";
+import { and, asc, eq, gt, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
+
+import type { AppDb } from "../../../db/client";
+import * as schema from "../../../db/d1";
+import type {
+	InactiveVaultCandidate,
+	VaultBootstrapRecord,
+	VaultKeyEnvelope,
+	VaultKeyWrapperInput,
+	VaultKeyWrapperRecord,
+	VaultRecord,
+} from "../../domain/types";
+import type {
+	VaultAuthorizationFacts,
+	VaultAuthorizationStore,
+} from "../../application/ports/outbound/vault-authorization-store";
+import type { VaultCatalogStore } from "../../application/ports/outbound/vault-catalog-store";
+import type { VaultKeyStore } from "../../application/ports/outbound/vault-key-store";
+import type { VaultLifecycleStore } from "../../application/ports/outbound/vault-lifecycle-store";
+
+export class DrizzleVaultStore
+	implements
+		VaultAuthorizationStore,
+		VaultCatalogStore,
+		VaultKeyStore,
+		VaultLifecycleStore
+{
+	constructor(private readonly db: AppDb) {}
+
+	async readVaultAuthorizationFacts(
+		userId: string,
+		vaultId: string,
+	): Promise<VaultAuthorizationFacts> {
+		const rows = await this.db
+			.select({
+				vaultId: schema.vault.id,
+				organizationId: schema.vault.organizationId,
+				deletedAt: schema.vault.deletedAt,
+				vaultMembershipStatus: schema.vaultMembership.status,
+				organizationRole: schema.member.role,
+			})
+			.from(schema.vault)
+			.leftJoin(
+				schema.vaultMembership,
+				and(
+					eq(schema.vaultMembership.vaultId, schema.vault.id),
+					eq(schema.vaultMembership.userId, userId),
+				),
+			)
+			.leftJoin(
+				schema.member,
+				and(
+					eq(schema.member.organizationId, schema.vault.organizationId),
+					eq(schema.member.userId, userId),
+				),
+			)
+			.where(eq(schema.vault.id, vaultId))
+			.limit(1);
+
+		const row = rows[0];
+		return {
+			vault: row
+				? {
+						organizationId: row.organizationId,
+						deleted: row.deletedAt !== null,
+					}
+				: null,
+			vaultMembership:
+				row?.vaultMembershipStatus !== null &&
+				row?.vaultMembershipStatus !== undefined
+					? {
+							status: row.vaultMembershipStatus,
+						}
+					: null,
+			organizationRole: row?.organizationRole ?? null,
+		};
+	}
+
+	async listVaultsForUser(
+		userId: string,
+		options: { includeDeleting?: boolean } = {},
+	): Promise<VaultRecord[]> {
+		const deletionFilter = options.includeDeleting
+			? undefined
+			: isNull(schema.vault.deletedAt);
+		const rows = await this.db
+			.select({
+				id: schema.vault.id,
+				organizationId: schema.vault.organizationId,
+				name: schema.vault.name,
+				activeKeyVersion: schema.vault.activeKeyVersion,
+				sharedAt: schema.vault.sharedAt,
+				createdAt: schema.vault.createdAt,
+				deletedAt: schema.vault.deletedAt,
+				purgeStatus: schema.vault.purgeStatus,
+				purgeError: schema.vault.purgeError,
+			})
+			.from(schema.vault)
+			.innerJoin(
+				schema.member,
+				eq(schema.member.organizationId, schema.vault.organizationId),
+			)
+			.where(
+				and(
+					eq(schema.member.userId, userId),
+					deletionFilter,
+				),
+			)
+			.orderBy(asc(schema.vault.createdAt));
+		return rows.map(toVaultRecord);
+	}
+
+	async readAccessibleVaultForUser(
+		userId: string,
+		vaultId: string,
+	): Promise<VaultRecord | null> {
+		const row = await this.readAccessibleVaultRowForUser(userId, vaultId);
+		return row ? toVaultRecord(row) : null;
+	}
+
+	async countVaultsForOrganization(organizationId: string): Promise<number> {
+		const rows = await this.db
+			.select({
+				id: schema.vault.id,
+			})
+			.from(schema.vault)
+			.where(
+				and(
+					eq(schema.vault.organizationId, organizationId),
+					isNull(schema.vault.deletedAt),
+				),
+			);
+
+		return rows.length;
+	}
+
+	async listActiveVaultIdsForOrganization(
+		organizationId: string,
+	): Promise<string[]> {
+		const rows = await this.db
+			.select({
+				id: schema.vault.id,
+			})
+			.from(schema.vault)
+			.where(
+				and(
+					eq(schema.vault.organizationId, organizationId),
+					isNull(schema.vault.deletedAt),
+				),
+			)
+			.orderBy(asc(schema.vault.createdAt));
+
+		return rows.map((row) => row.id);
+	}
+
+	async vaultNameExistsForOrganization(
+		organizationId: string,
+		name: string,
+	): Promise<boolean> {
+		const rows = await this.db
+			.select({
+				id: schema.vault.id,
+			})
+			.from(schema.vault)
+			.where(
+				and(
+					eq(schema.vault.organizationId, organizationId),
+					eq(schema.vault.name, name),
+					isNull(schema.vault.deletedAt),
+				),
+			)
+			.limit(1);
+
+		return rows.length > 0;
+	}
+
+	async createVaultForUser(
+		userId: string,
+		organizationId: string,
+		name: string,
+		initialWrapper: VaultKeyWrapperInput,
+		maxVaults = 0,
+	): Promise<VaultRecord> {
+		const vaultId = crypto.randomUUID();
+		const now = Date.now();
+		// D1/libSQL batch is atomic; the conditional INSERT reserves the quota slot.
+		// Dependent writes select that row, so a failed reservation creates nothing.
+		const [rows] = await this.db.batch([
+			this.db
+				.insert(schema.vault)
+				.select(
+					sql`SELECT ${vaultId}, ${organizationId}, ${name}, CASE WHEN (SELECT count(*) FROM member WHERE organization_id=${organizationId})>1 THEN ${now} ELSE null END, ${initialWrapper.envelope.keyVersion}, ${now}, null, null, null
+          WHERE (${maxVaults}=0 OR (SELECT count(*) FROM vault WHERE organization_id=${organizationId} AND deleted_at IS NULL)<${maxVaults})
+          AND EXISTS (SELECT 1 FROM member WHERE organization_id=${organizationId} AND user_id=${userId} AND role IN ('owner','admin'))`,
+				)
+				.returning(),
+			this.db
+				.insert(schema.vaultKeyWrapper)
+				.select(
+					sql`SELECT ${crypto.randomUUID()}, ${vaultId}, ${initialWrapper.envelope.keyVersion}, ${initialWrapper.kind}, ${userId}, ${JSON.stringify(initialWrapper.envelope)}, ${now}, null FROM vault WHERE id=${vaultId}`,
+				),
+			this.db
+				.insert(schema.vaultMembership)
+				.select(
+					sql`SELECT ${vaultId}, ${userId}, 1, 1, 'active', ${now}, null FROM vault WHERE id=${vaultId}`,
+				),
+		]);
+		if (!rows[0])
+			throw new VaultApplicationError("vault_limit_exceeded", {
+				planName: "Organization",
+				limit: maxVaults,
+			});
+		return toVaultRecord(rows[0]);
+	}
+
+	async readDefaultOrganizationIdForUser(
+		userId: string,
+	): Promise<string | null> {
+		const rows = await this.db
+			.select({
+				organizationId: schema.member.organizationId,
+			})
+			.from(schema.member)
+			.where(eq(schema.member.userId, userId))
+			.orderBy(asc(schema.member.createdAt))
+			.limit(1);
+
+		return rows[0]?.organizationId ?? null;
+	}
+
+	async userIsOrganizationMember(
+		userId: string,
+		organizationId: string,
+	): Promise<boolean> {
+		const rows = await this.db
+			.select({
+				userId: schema.member.userId,
+			})
+			.from(schema.member)
+			.where(
+				and(
+					eq(schema.member.userId, userId),
+					eq(schema.member.organizationId, organizationId),
+				),
+			)
+			.limit(1);
+
+		return rows.length > 0;
+	}
+
+	async readVaultOrganizationId(vaultId: string): Promise<string | null> {
+		const rows = await this.db
+			.select({
+				organizationId: schema.vault.organizationId,
+			})
+			.from(schema.vault)
+			.where(and(eq(schema.vault.id, vaultId), isNull(schema.vault.deletedAt)))
+			.limit(1);
+
+		return rows[0]?.organizationId ?? null;
+	}
+
+	/**
+	 * Returns whether this call was the one that queued the deletion. The
+	 * `deletedAt IS NULL` guard makes the transition a claim, so a scheduled
+	 * purge cannot race a manual delete into queueing the same vault twice.
+	 */
+	async markVaultDeletionQueued(vaultId: string): Promise<boolean> {
+		const claimed = await this.db
+			.update(schema.vault)
+			.set({
+				deletedAt: new Date(),
+				purgeStatus: "queued",
+				purgeError: null,
+			})
+			.where(and(eq(schema.vault.id, vaultId), isNull(schema.vault.deletedAt)))
+			.returning({ id: schema.vault.id });
+
+		return claimed.length > 0;
+	}
+
+	/**
+	 * Owner-held vaults whose newest content commit (or creation, when nothing
+	 * was ever committed) is at or before `inactiveSince`.
+	 */
+	async listInactiveVaultCandidates(
+		inactiveSince: number,
+		afterVaultId: string | null,
+		limit: number,
+	): Promise<InactiveVaultCandidate[]> {
+		const rows = await this.db
+			.select({
+				vaultId: schema.vault.id,
+				organizationId: schema.vault.organizationId,
+				vaultName: schema.vault.name,
+				ownerEmail: schema.user.email,
+				lastCommitAt: schema.vaultSyncStatus.lastCommitAt,
+			})
+			.from(schema.vault)
+			.innerJoin(
+				schema.member,
+				eq(schema.member.organizationId, schema.vault.organizationId),
+			)
+			.innerJoin(schema.user, eq(schema.user.id, schema.member.userId))
+			.leftJoin(
+				schema.vaultSyncStatus,
+				eq(schema.vaultSyncStatus.vaultId, schema.vault.id),
+			)
+			.where(
+				and(
+					isNull(schema.vault.deletedAt),
+					isNull(schema.vault.sharedAt),
+					eq(schema.member.role, "owner"),
+					lte(
+						sql`coalesce(${schema.vaultSyncStatus.lastCommitAt}, ${schema.vault.createdAt})`,
+						inactiveSince,
+					),
+					afterVaultId ? gt(schema.vault.id, afterVaultId) : undefined,
+				),
+			)
+			.orderBy(asc(schema.vault.id))
+			.limit(limit);
+
+		return rows;
+	}
+
+	async markVaultPurgeRunning(vaultId: string): Promise<void> {
+		await this.db
+			.update(schema.vault)
+			.set({
+				purgeStatus: "running",
+				purgeError: null,
+			})
+			.where(
+				and(eq(schema.vault.id, vaultId), isNotNull(schema.vault.deletedAt)),
+			);
+	}
+
+	async markVaultPurgeFailed(vaultId: string, message: string): Promise<void> {
+		await this.db
+			.update(schema.vault)
+			.set({
+				purgeStatus: "failed",
+				purgeError: message,
+			})
+			.where(
+				and(eq(schema.vault.id, vaultId), isNotNull(schema.vault.deletedAt)),
+			);
+	}
+
+	async markVaultDeletionQueueFailed(
+		vaultId: string,
+		message: string,
+	): Promise<void> {
+		await this.db
+			.update(schema.vault)
+			.set({
+				deletedAt: null,
+				purgeStatus: "failed",
+				purgeError: message,
+			})
+			.where(eq(schema.vault.id, vaultId));
+	}
+
+	async hardDeleteVault(vaultId: string): Promise<void> {
+		await this.db.delete(schema.vault).where(eq(schema.vault.id, vaultId));
+	}
+
+	async readVaultBootstrapForUser(
+		userId: string,
+		vaultId: string,
+	): Promise<VaultBootstrapRecord | null> {
+		const vault = await this.readAccessibleVaultRowForUser(userId, vaultId);
+		if (!vault) {
+			return null;
+		}
+
+		const wrapperRows = await this.db
+			.select()
+			.from(schema.vaultKeyWrapper)
+			.where(
+				and(
+					eq(schema.vaultKeyWrapper.vaultId, vaultId),
+					isNull(schema.vaultKeyWrapper.revokedAt),
+					or(
+						eq(schema.vaultKeyWrapper.userId, userId),
+						and(
+							isNull(schema.vaultKeyWrapper.userId),
+							sql`${vault.sharedAt === null}`,
+						),
+					),
+				),
+			)
+			.orderBy(asc(schema.vaultKeyWrapper.createdAt));
+
+		return {
+			vault: toVaultRecord(vault),
+			wrappers: wrapperRows.map(toVaultKeyWrapperRecord),
+		};
+	}
+
+	async upsertPasswordWrapperForUser(
+		userId: string,
+		vaultId: string,
+		envelope: VaultKeyEnvelope,
+	): Promise<VaultKeyWrapperRecord> {
+		const authorized = sql`exists (select 1 from vault v join vault_membership m on m.vault_id=v.id join member o on o.organization_id=v.organization_id and o.user_id=m.user_id where v.id=${vaultId} and v.deleted_at is null and m.user_id=${userId} and m.status='active' and v.active_key_version=${envelope.keyVersion})`;
+		const [rows] = await this.db.batch([
+			this.db
+				.insert(schema.vaultKeyWrapper)
+				.select(
+					sql`select ${crypto.randomUUID()}, ${vaultId}, ${envelope.keyVersion}, 'password', ${userId}, ${JSON.stringify(envelope)}, ${Date.now()}, null where ${authorized}`,
+				)
+				.onConflictDoUpdate({
+					target: [
+						schema.vaultKeyWrapper.vaultId,
+						schema.vaultKeyWrapper.kind,
+						schema.vaultKeyWrapper.userId,
+					],
+					set: { envelopeJson: envelope, revokedAt: null },
+				})
+				.returning(),
+			// An older recovery must not overwrite a password that was just changed.
+			this.db
+				.update(schema.vaultKeyRequest)
+				.set({ status: "canceled", envelopeJson: null })
+				.where(
+					and(
+						eq(schema.vaultKeyRequest.vaultId, vaultId),
+						eq(schema.vaultKeyRequest.userId, userId),
+						sql`${schema.vaultKeyRequest.status} in ('pending','approved')`,
+						authorized,
+					),
+				),
+		]);
+		if (!rows[0]) throw new VaultApplicationError("forbidden");
+		return toVaultKeyWrapperRecord(rows[0]);
+	}
+
+	private async readAccessibleVaultRowForUser(
+		userId: string,
+		vaultId: string,
+	): Promise<typeof schema.vault.$inferSelect | null> {
+		const rows = await this.db
+			.select({
+				id: schema.vault.id,
+				organizationId: schema.vault.organizationId,
+				name: schema.vault.name,
+				activeKeyVersion: schema.vault.activeKeyVersion,
+				sharedAt: schema.vault.sharedAt,
+				createdAt: schema.vault.createdAt,
+				deletedAt: schema.vault.deletedAt,
+				purgeStatus: schema.vault.purgeStatus,
+				purgeError: schema.vault.purgeError,
+			})
+			.from(schema.vault)
+			.innerJoin(
+				schema.vaultMembership,
+				eq(schema.vaultMembership.vaultId, schema.vault.id),
+			)
+			.innerJoin(
+				schema.member,
+				eq(schema.member.organizationId, schema.vault.organizationId),
+			)
+			.where(
+				and(
+					eq(schema.vault.id, vaultId),
+					eq(schema.vaultMembership.userId, userId),
+					eq(schema.vaultMembership.status, "active"),
+					eq(schema.member.userId, userId),
+					isNull(schema.vault.deletedAt),
+				),
+			)
+			.limit(1);
+
+		return rows[0] ?? null;
+	}
+}
+
+function toVaultRecord(row: typeof schema.vault.$inferSelect): VaultRecord {
+	return {
+		id: row.id,
+		organizationId: row.organizationId,
+		name: row.name,
+		activeKeyVersion: row.activeKeyVersion,
+		createdAt: row.createdAt,
+		deletedAt: row.deletedAt,
+		purgeStatus: isVaultPurgeStatus(row.purgeStatus) ? row.purgeStatus : null,
+		purgeError: row.purgeError,
+	};
+}
+
+function isVaultPurgeStatus(
+	value: unknown,
+): value is VaultRecord["purgeStatus"] {
+	return (
+		value === "queued" ||
+		value === "running" ||
+		value === "failed" ||
+		value === null
+	);
+}
+
+function toVaultKeyWrapperRecord(
+	row: typeof schema.vaultKeyWrapper.$inferSelect,
+): VaultKeyWrapperRecord {
+	return {
+		id: row.id,
+		vaultId: row.vaultId,
+		keyVersion: row.keyVersion,
+		kind: row.kind as VaultKeyWrapperRecord["kind"],
+		userId: row.userId,
+		envelope: row.envelopeJson,
+		createdAt: row.createdAt,
+		revokedAt: row.revokedAt,
+	};
+}

@@ -1,0 +1,260 @@
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { z } from "zod";
+
+import { onError } from "../../../../errors";
+import { mapSyncCoordinatorApplicationError } from "./error-mapper";
+import {
+	BLOB_SIZE_HEADER,
+	parseBlobSizeHeader,
+} from "../../../../platform/http/blob-size";
+import {
+	parseBearerToken,
+	SYNC_WEBSOCKET_AUTH_PROTOCOL_PREFIX,
+} from "../../../../sync-access/application";
+import type {
+	SyncPauseState,
+	SyncRepairResult,
+} from "../../../application/dto/sync-repair";
+import type {
+	SocketSession,
+	VaultStateLimits,
+} from "../../../application/dto/types";
+
+export interface CoordinatorHttpServices {
+	setSyncPause(vaultId: string, reason: string | null): { syncPause: SyncPauseState | null };
+	repairSyncState(vaultId: string): Promise<SyncRepairResult>;
+	readSyncPause(vaultId: string): SyncPauseState | null;
+	stageBlob(
+		token: string | null,
+		vaultId: string,
+		blobId: string,
+		sizeBytes: number,
+	): Promise<void>;
+	abortStagedBlob(vaultId: string, blobId: string): Promise<void>;
+	applyVaultPolicy(
+		vaultId: string,
+		limits: VaultStateLimits,
+	): Promise<{ applied: boolean }>;
+	purgeVault(vaultId: string): Promise<void>;
+	prepareSocketSession(
+		token: string | null,
+		vaultId: string,
+	): Promise<SocketSession>;
+	completeSocketOpen(): Promise<void>;
+	assertSessionAccess(session: SocketSession): void;
+}
+
+export type CoordinatorSocketHandshake = {
+	openSocket(request: Request, session: SocketSession): Promise<Response>;
+};
+
+const policyLimitsSchema = z.object({
+	storageLimitBytes: z.number().int().nonnegative(),
+	maxFileSizeBytes: z.number().int().nonnegative(),
+	versionHistoryRetentionDays: z.number().int().nonnegative(),
+});
+
+export function createCoordinatorApp(deps: {
+	services: CoordinatorHttpServices;
+	socketHandshake: CoordinatorSocketHandshake;
+	authorize?: (token: string | null, vaultId: string) => Promise<unknown>;
+	refreshSharing?: (vaultId: string) => Promise<void>;
+	canApplyPolicy?: (vaultId: string) => Promise<boolean>;
+}) {
+	const app = new Hono();
+	app.post("/internal/v1/vaults/:vaultId/sync-pause",
+		zValidator("json", z.object({ reason: z.string().trim().min(1).max(500) })),
+		(c) => c.json(deps.services.setSyncPause(c.req.param("vaultId"), c.req.valid("json").reason)),
+	);
+	app.post("/internal/v1/vaults/:vaultId/sync-resume", (c) =>
+		c.json(deps.services.setSyncPause(c.req.param("vaultId"), null)),
+	);
+	app.post("/internal/v1/vaults/:vaultId/authorize", async (c) => {
+		if (!deps.authorize) return c.json({ error: "access_unavailable" }, 503);
+		await deps.authorize(readSyncToken(c.req.raw), c.req.param("vaultId"));
+		return c.json({ ok: true });
+	});
+	app.post("/internal/v1/vaults/:vaultId/sharing-refresh", async (c) => {
+		await deps.refreshSharing?.(c.req.param("vaultId"));
+		return c.json({ ok: true });
+	});
+
+	app.post(
+		"/internal/v1/vaults/:vaultId/sync-repair",
+		zValidator(
+			"param",
+			z.object({
+				vaultId: z.string().trim().min(1),
+			}),
+		),
+		async (c) => {
+			const { vaultId } = c.req.valid("param");
+			return c.json(await deps.services.repairSyncState(vaultId));
+		},
+	);
+
+	app.get(
+		"/internal/v1/vaults/:vaultId/sync-state",
+		zValidator(
+			"param",
+			z.object({
+				vaultId: z.string().trim().min(1),
+			}),
+		),
+		async (c) => {
+			const { vaultId } = c.req.valid("param");
+			return c.json({ syncPause: deps.services.readSyncPause(vaultId) });
+		},
+	);
+
+	app.put(
+		"/internal/v1/vaults/:vaultId/blobs/:blobId/stage",
+		zValidator(
+			"param",
+			z.object({
+				vaultId: z.string().trim().min(1),
+				blobId: z.string().trim().min(1),
+			}),
+		),
+		async (c) => {
+			const { vaultId, blobId } = c.req.valid("param");
+			const sizeBytes = parseBlobSizeHeader(
+				c.req.raw.headers.get(BLOB_SIZE_HEADER),
+			);
+			if (sizeBytes === null) {
+				return c.json(
+					{
+						error: "bad_request",
+						message: `blob stage requires a valid ${BLOB_SIZE_HEADER} header`,
+					},
+					400,
+				);
+			}
+			await deps.services.stageBlob(
+				readSyncToken(c.req.raw),
+				vaultId,
+				blobId,
+				sizeBytes,
+			);
+			return new Response(null, { status: 204 });
+		},
+	);
+
+	app.delete(
+		"/internal/v1/vaults/:vaultId/blobs/:blobId/stage",
+		zValidator(
+			"param",
+			z.object({
+				vaultId: z.string().trim().min(1),
+				blobId: z.string().trim().min(1),
+			}),
+		),
+		async (c) => {
+			const { vaultId, blobId } = c.req.valid("param");
+			await deps.services.abortStagedBlob(vaultId, blobId);
+			return new Response(null, { status: 204 });
+		},
+	);
+
+	app.put(
+		"/internal/v1/vaults/:vaultId/policy",
+		zValidator(
+			"param",
+			z.object({
+				vaultId: z.string().trim().min(1),
+			}),
+		),
+		zValidator(
+			"json",
+			z.object({
+				limits: policyLimitsSchema,
+			}),
+		),
+		async (c) => {
+			const { vaultId } = c.req.valid("param");
+			const body = c.req.valid("json");
+			await deps.refreshSharing?.(c.req.param("vaultId"));
+			if (deps.canApplyPolicy && !(await deps.canApplyPolicy(vaultId)))
+				return c.json({ applied: false });
+			const result = await deps.services.applyVaultPolicy(vaultId, body.limits);
+			return c.json(result);
+		},
+	);
+
+	app.post(
+		"/internal/v1/vaults/:vaultId/purge",
+		zValidator(
+			"param",
+			z.object({
+				vaultId: z.string().trim().min(1),
+			}),
+		),
+		async (c) => {
+			const { vaultId } = c.req.valid("param");
+			await deps.services.purgeVault(vaultId);
+			return new Response(null, { status: 204 });
+		},
+	);
+
+	app.get(
+		"/v1/vaults/:vaultId/socket",
+		zValidator(
+			"param",
+			z.object({
+				vaultId: z.string().trim().min(1),
+			}),
+		),
+		async (c) => {
+			const request = c.req.raw;
+			if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+				return c.json(
+					{
+						error: "bad_request",
+						message: "expected websocket upgrade",
+					},
+					400,
+				);
+			}
+
+			const { vaultId } = c.req.valid("param");
+			const session = await deps.services.prepareSocketSession(
+				readSyncToken(request),
+				vaultId,
+			);
+			deps.services.assertSessionAccess(session);
+			const response = await deps.socketHandshake.openSocket(request, session);
+			await deps.services.completeSocketOpen();
+			return response;
+		},
+	);
+	app.notFound((c) =>
+		c.json(
+			{
+				error: "not_found",
+				message: "unknown sync coordinator route",
+			},
+			404,
+		),
+	);
+
+	app.onError(
+		(error, c) =>
+			mapSyncCoordinatorApplicationError(error) ?? onError(error, c),
+	);
+
+	return app;
+}
+
+function readSyncToken(request: Request): string | null {
+	const bearer = parseBearerToken(request.headers.get("authorization"));
+	if (bearer) return bearer;
+	const protocols = request.headers.get("sec-websocket-protocol") ?? "";
+	for (const protocol of protocols.split(",").map((value) => value.trim())) {
+		if (protocol.startsWith(SYNC_WEBSOCKET_AUTH_PROTOCOL_PREFIX)) {
+			const token = protocol.slice(SYNC_WEBSOCKET_AUTH_PROTOCOL_PREFIX.length);
+			if (token) return token;
+		}
+	}
+	return null;
+}
